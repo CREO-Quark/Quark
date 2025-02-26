@@ -1,12 +1,11 @@
 import json
 from collections.abc import Callable
+from threading import Thread
 from typing import Any
 
 import redis
 
-from quark.base import GlobalStatics, ConfigDict
-from . import LOGGER
-from threading import Thread
+from quark.base import GlobalStatics, ConfigDict, LOGGER
 
 LOGGER = LOGGER.getChild('RedisServer')
 CONFIG: ConfigDict = GlobalStatics.CONFIG
@@ -105,10 +104,29 @@ class Server(object):
 
 
 class Client(object):
-    def __init__(self, topic: str | list[str] = None, callback: Callable | list[Callable] | dict[str, Callable] = None, redis_host: str = None, redis_port: int = None, redis_password: str = None):
+    def __init__(
+            self,
+            topic: str | list[str] = None,
+            callback: Callable | list[Callable] | dict[str, Callable] = None,
+            redis_host: str = None,
+            redis_port: int = None,
+            redis_password: str = None,
+            ssh_host: str = None,
+            ssh_port: int = 22,
+            ssh_username: str = None,
+            ssh_password: str = None,
+            ssh_pkey: str = None
+    ):
         self.redis_host = redis_host if redis_host is not None else CONFIG.get_config('Application.Redis.HOST', default='localhost')
         self.redis_port = redis_port if redis_port is not None else CONFIG.get_config('Application.Redis.PORT', default=6379)
         self.redis_password = redis_password if redis_password is not None else CONFIG.get_config('Application.Redis.PASSWORD', default=None)
+
+        self.ssh_host = ssh_host
+        self.ssh_port = ssh_port
+        self.ssh_username = ssh_username
+        self.ssh_password = ssh_password
+        self.ssh_pkey = ssh_pkey
+        self.ssh_tunnel = None
 
         self.topic: set[str] = set()
         self.callback: dict[str, Callable[[str | bytes], None]] = {}
@@ -127,7 +145,7 @@ class Client(object):
         elif topic is None and callback is None:
             pass
         else:
-            raise TypeError(f'Can not add {topic=} and {callback=} to subscription.')
+            raise TypeError(f'Cannot add {topic=} and {callback=} to subscription.')
 
     def subscribe(self, topic: str, callback: Callable[[str | bytes], None]):
         if topic in self.topic:
@@ -136,7 +154,7 @@ class Client(object):
         self.topic.add(topic)
         self.callback[topic] = callback
 
-        # Subscript to the topic
+        # Subscribe to the topic
         self.redis_pubsub.subscribe(f'{topic}.realtime')
         LOGGER.info(f"Subscribed to topics: {', '.join(self.topic)}.")
 
@@ -175,28 +193,48 @@ class Client(object):
             raise ValueError(f"No callback registered for topic: {topic}")
 
     def start(self):
-        """Initialize the Redis connection and start listening to the channel."""
+        """Initialize the Redis connection with optional SSH tunneling."""
+        if self.ssh_host:
+            from sshtunnel import SSHTunnelForwarder
+            self.ssh_tunnel = SSHTunnelForwarder(
+                (self.ssh_host, self.ssh_port),
+                ssh_username=self.ssh_username,
+                ssh_password=self.ssh_password,
+                ssh_pkey=self.ssh_pkey,
+                remote_bind_address=(self.redis_host, self.redis_port)
+            )
+            self.ssh_tunnel.start()
+            self.redis_host = 'localhost'
+            self.redis_port = self.ssh_tunnel.local_bind_port
+            LOGGER.info(f"SSH tunnel established: localhost:{self.redis_port} -> {self.redis_host}:{self.redis_port}")
 
+        # Connect to Redis
         if self.redis_password:
             self.redis_conn = redis.StrictRedis(host=self.redis_host, port=self.redis_port, password=self.redis_password, decode_responses=True)
         else:
             self.redis_conn = redis.StrictRedis(host=self.redis_host, port=self.redis_port, decode_responses=True)
         self.redis_pubsub = self.redis_conn.pubsub()
         LOGGER.info(f"Connected to Redis at {self.redis_host}:{self.redis_port}")
-        # self.redis_pubsub.psubscribe('*.realtime')
+
         # Start listening to the Redis channel
         self.pubsub_thread = Thread(target=self.listen_to_channel)
         self.pubsub_thread.start()
 
     def stop(self):
-        """Clean up and disconnect the Redis connection."""
+        """Clean up and disconnect the Redis connection and SSH tunnel."""
         if not self.redis_conn:
             LOGGER.info("Client already stopped!")
 
         LOGGER.info("Client stopping. Disconnecting from Redis...")
-        self.redis_conn.close()
+        if self.redis_conn:
+            self.redis_conn.close()
         self.redis_conn = None
         self.redis_pubsub = None
+
+        if self.ssh_tunnel:
+            LOGGER.info("Closing SSH tunnel...")
+            self.ssh_tunnel.stop()
+            self.ssh_tunnel = None
 
     def listen_to_channel(self):
         """Subscribe to the Redis channel for new structured data and print incoming messages."""
