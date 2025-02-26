@@ -19,7 +19,7 @@ LOGGER = LOGGER.getChild('FactorPool')
 
 class FactorPool(object, metaclass=abc.ABCMeta):
 
-    def __init__(self, log_interval=None):
+    def __init__(self, log_interval: float = None):
         self.log_interval = CONFIG.Statistics.FACTOR_SAMPLING_INTERVAL if log_interval is None else log_interval
 
         self.storage: dict[datetime.date, dict[float, dict[str, float]]] = {}  # market_date -> timestamp -> entry_key -> entry_value

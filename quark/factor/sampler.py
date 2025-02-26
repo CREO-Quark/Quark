@@ -145,12 +145,10 @@ class SamplerData(dict):
 
         history = self['history'][ticker] = deque(maxlen=self.max_size)
         active = self['active'][ticker] = []
+        index = self['index'][ticker] = kwargs.pop('index', 0.)
 
         for key, value in kwargs.items():
             self[key][ticker] = value
-
-        if 'index' not in kwargs:
-            self['index'][ticker] = 0
 
         return history, active
 
@@ -430,14 +428,14 @@ class MarketDataSampler(object, metaclass=abc.ABCMeta):
         self.sampler_data: dict[str, SamplerData] = getattr(self, 'sampler_data', {})  # to avoid de-reference the dict during nested inheritance initialization.
         self.contexts: dict = getattr(self, 'contexts', {})
 
-    def register_sampler(self, topic: str, max_size: int, mode: SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median'], **kwargs) -> SamplerData:
+    def register_sampler(self, topic: str, mode: SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median'], max_size: int, **kwargs) -> SamplerData:
         """
         Registers a new sampler with the specified topic and parameters.
 
         Args:
             topic (str): The topic for the sampler.
-            max_size (int): The maximum size of the history deque.
             mode (SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median']): The aggregation mode for the sampler.
+            max_size (int): The maximum size of the history deque.
             **kwargs: Additional keyword arguments for `SamplerData`.
 
         Returns:
@@ -722,13 +720,14 @@ class FixedIntervalSampler(MarketDataSampler, metaclass=abc.ABCMeta):
         super().__init__()
         self.contexts['idx']: dict[str, int] = {}
 
-    def register_sampler(self, topic: str, mode: SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median'], **kwargs) -> dict:
+    def register_sampler(self, topic: str, mode: SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median'], max_size: int = None, **kwargs) -> dict:
         """
         Registers a sampler for a specific topic with a specified mode and additional options.
 
         Args:
             topic (str): The topic to register the sampler under.
             mode (SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median']): The mode in which the sampler operates.
+            max_size (int): The maximum size of the history deque.
             **kwargs: Additional options for configuring the sampler.
 
         Returns:
@@ -736,12 +735,46 @@ class FixedIntervalSampler(MarketDataSampler, metaclass=abc.ABCMeta):
         """
         sampler_data = super().register_sampler(
             topic=topic,
-            max_size=self.sample_size,
+            max_size=self.sample_size if max_size is None else max_size,
             mode=mode,
             **kwargs
         )
 
         return sampler_data
+
+    def register_dummy(self, name: str = 'dummy', **kwargs):
+        """
+        A dummy ticker provides an easy way to trigger the callback with sampling on aggregated indicators like timestamp and volume.
+
+        to use the callback function, override on_dummy_triggered method.
+        """
+
+        dummy_info = {
+            'name': name,
+            'idx': 0,
+            **kwargs
+        }
+
+        self.contexts.setdefault(f'{self.__class__.__name__}.dummy', []).append(dummy_info)
+
+    def check_dummy_triggered(self, topic: str, sampler: SamplerData, **kwargs) -> None:
+        if (dummy_info_key := f'{self.__class__.__name__}.dummy') not in self.contexts:
+            return
+
+        if 'idx' in kwargs:
+            idx = kwargs['idx']
+        else:
+            idx = self.contexts['timestamp'] // self.sampling_interval
+
+        for dummy_info in self.contexts[dummy_info_key]:
+            last_idx = dummy_info['idx']
+
+            if idx > last_idx:
+                self.on_dummy_triggered(dummy_ticker=dummy_info['name'], topic=topic, sampler=sampler, **kwargs)
+                dummy_info['idx'] = idx
+
+    def on_dummy_triggered(self, dummy_ticker: str, topic: str, sampler: SamplerData, **kwargs) -> None:
+        pass
 
     def log_obs(self, ticker: str, timestamp: float, observation: dict[str, ...] = None, **kwargs):
         """
@@ -758,17 +791,16 @@ class FixedIntervalSampler(MarketDataSampler, metaclass=abc.ABCMeta):
         Raises:
             ValueError: If the topic for the observation is not found in the sampler data.
         """
-        observation_copy = {}
-
         if observation is not None:
-            observation_copy.update(observation)
+            kwargs.update(observation)
 
-        observation_copy.update(kwargs)
+        observation = kwargs
 
         last_idx = self.contexts['idx'].get(ticker, 0)
         idx = self.contexts['idx'][ticker] = timestamp // self.sampling_interval
 
-        for topic, obs_value in observation_copy.items():
+        # check sampler
+        for topic, obs_value in observation.items():
             if topic not in self.sampler_data:
                 raise ValueError(f'Invalid sampler topic: {topic}! Expected topic {list(self.sampler_data)}.')
 
@@ -782,7 +814,8 @@ class FixedIntervalSampler(MarketDataSampler, metaclass=abc.ABCMeta):
             if idx > last_idx:
                 sampler_data.enroll(ticker=ticker, index=idx)
                 sampler_data.observe(ticker=ticker, obs=obs_value, index=idx)
-                self.on_triggered(ticker=ticker, topic=sampler_data.topic, sampler=sampler_data)
+                self.on_triggered(ticker=ticker, topic=topic, sampler=sampler_data)
+                self.check_dummy_triggered(topic=topic, sampler=sampler_data, idx=idx)
             else:
                 sampler_data.observe(ticker=ticker, obs=obs_value, index=idx)
 
@@ -817,6 +850,11 @@ class FixedIntervalSampler(MarketDataSampler, metaclass=abc.ABCMeta):
             self.sampler_data[topic] = sampler_data
 
         return self
+
+    def clear(self):
+        super().clear()
+
+        self.contexts.pop(f'{self.__class__.__name__}.dummy', None)
 
 
 class FixedVolumeIntervalSampler(FixedIntervalSampler, metaclass=abc.ABCMeta):
@@ -859,6 +897,17 @@ class FixedVolumeIntervalSampler(FixedIntervalSampler, metaclass=abc.ABCMeta):
 
         self.contexts['vol_acc']: dict[str, float] = {}
         self.contexts['use_notional']: bool = use_notional
+
+    def register_dummy(self, name: str = 'dummy', idx_mode: Literal['mean', 'median', 'weighted'] = 'weighted', weights: dict[str, float] = None, **kwargs):
+        if weights is None and idx_mode == 'weighted' and hasattr(self, 'weights'):
+            weights = self.weights
+
+        super().register_dummy(
+            name=name,
+            idx_mode=idx_mode,
+            weights=weights,
+            **kwargs
+        )
 
     @overload
     def accumulate_volume(self, ticker: str, volume: float):
@@ -927,6 +976,30 @@ class FixedVolumeIntervalSampler(FixedIntervalSampler, metaclass=abc.ABCMeta):
             observation=observation,
             **kwargs
         )
+
+    def check_dummy_triggered(self, topic: str, sampler: SamplerData, **kwargs) -> None:
+        if (dummy_info_key := f'{self.__class__.__name__}.dummy') not in self.contexts:
+            return
+
+        for dummy_info in self.contexts[dummy_info_key]:
+            last_idx = dummy_info['idx']
+            weights = dummy_info.get('weights')
+            idx_list = [self.contexts['idx'].get(_ticker, 0.) for _ticker in weights] if weights else list(self.contexts['idx'].values())
+
+            match dummy_info['idx_mode']:
+                case 'mean':
+                    idx = np.mean(idx_list)
+                case 'median':
+                    idx = np.median(idx_list)
+                case 'weighted':
+                    idx = np.average(idx_list, weights=list(weights.values()))
+                case _:
+                    raise ValueError(f'Invalid index mode for {dummy_info['name']} {dummy_info['idx_mode']}.')
+
+            idx = np.floor(idx)
+            if idx > last_idx:
+                self.on_dummy_triggered(dummy_ticker=dummy_info['name'], topic=topic, sampler=sampler, **kwargs)
+                dummy_info['idx'] = idx
 
     def to_json(self, fmt='str', **kwargs) -> str | dict:
         data_dict = super().to_json(fmt='dict')
@@ -1025,6 +1098,7 @@ class AdaptiveVolumeIntervalSampler(FixedVolumeIntervalSampler, metaclass=abc.AB
         self.baseline_window = baseline_window
         self.aligned_interval = aligned_interval
 
+        self.contexts['idx_vol'] = {}
         self.contexts['vol_baseline'] = self.VolumeBaseline(
             baseline={},
             sampling_interval={},
@@ -1033,8 +1107,13 @@ class AdaptiveVolumeIntervalSampler(FixedVolumeIntervalSampler, metaclass=abc.AB
             obs_vol_acc={}
         )
 
-    def register_sampler(self, topic: str, mode: SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median'], **kwargs) -> dict:
-        sampler_data = super().register_sampler(topic=topic, mode=mode, index_vol={}, **kwargs)
+    def register_sampler(self, topic: str, mode: SamplerMode | Literal['update', 'accumulate', 'min', 'max', 'median'], max_size: int = None, **kwargs) -> dict:
+        sampler_data = super().register_sampler(
+            topic=topic,
+            mode=mode,
+            max_size=max_size,
+            **kwargs
+        )
         return sampler_data
 
     def _update_volume_baseline(self, ticker: str, timestamp: float, volume_accumulated: float = None, min_obs: int = None, auto_register: bool = True) -> float | None:
@@ -1144,12 +1223,13 @@ class AdaptiveVolumeIntervalSampler(FixedVolumeIntervalSampler, metaclass=abc.AB
 
         """
         # step 0: copy the observation
-        observation_copy = {}
-
         if observation is not None:
-            observation_copy.update(observation)
+            kwargs.update(observation)
 
-        observation_copy.update(kwargs)
+        observation = kwargs
+
+        last_idx_ts = self.contexts['idx'].get(ticker, 0)
+        last_idx_vol = self.contexts['idx_vol'].get(ticker, 0)
 
         if volume_accumulated is None:
             volume_accumulated = self.contexts['vol_acc'].get(ticker, 0.)
@@ -1192,27 +1272,52 @@ class AdaptiveVolumeIntervalSampler(FixedVolumeIntervalSampler, metaclass=abc.AB
             idx_ts = 0.
             idx_vol = volume_accumulated // volume_sampling_interval
 
+        self.contexts['idx'][ticker] = idx_ts
+        self.contexts['idx_vol'][ticker] = idx_vol
+
         # step 3: update sampler
-        for topic, obs_value in observation_copy.items():
+        for topic, obs_value in observation.items():
             if topic not in self.sampler_data:
                 raise ValueError(f'Invalid sampler topic: {topic}! Expected topic {list(self.sampler_data)}.')
 
             sampler_data = self.sampler_data[topic]
 
             if ticker not in sampler_data:
-                sampler_data.init(ticker=ticker, index_vol=0)
-
-            last_idx_ts = sampler_data['index'][ticker]
-            last_idx_vol = sampler_data['index_vol'][ticker]
+                sampler_data.init(ticker=ticker)
 
             if last_idx_ts == last_idx_vol == 0:
-                sampler_data.observe(ticker=ticker, obs=obs_value, index=idx_ts, index_vol=idx_vol)
+                sampler_data.observe(ticker=ticker, obs=obs_value)
             elif idx_ts > last_idx_ts or idx_vol > last_idx_vol:
                 sampler_data.enroll(ticker=ticker)
-                sampler_data.observe(ticker=ticker, obs=obs_value, index=idx_ts, index_vol=idx_vol)
+                sampler_data.observe(ticker=ticker, obs=obs_value)
                 self.on_triggered(ticker=ticker, topic=topic, sampler=sampler_data)
+                self.check_dummy_triggered(topic=topic, sampler=sampler_data)
             else:
                 sampler_data.observe(ticker=ticker, obs=obs_value)
+
+    def check_dummy_triggered(self, topic: str, sampler: SamplerData, **kwargs) -> None:
+        if (dummy_info_key := f'{self.__class__.__name__}.dummy') not in self.contexts:
+            return
+
+        for dummy_info in self.contexts[dummy_info_key]:
+            last_idx = dummy_info['idx']
+            weights = dummy_info.get('weights')
+            idx_list = [sampler['index'].get(_ticker, 0.) for _ticker in weights] if weights else list(sampler['index'].values())
+
+            match dummy_info['idx_mode']:
+                case 'mean':
+                    idx = np.mean(idx_list)
+                case 'median':
+                    idx = np.median(idx_list)
+                case 'weighted':
+                    idx = np.average(idx_list, weights=list(weights.values()))
+                case _:
+                    raise ValueError(f'Invalid index mode for {dummy_info['name']} {dummy_info['idx_mode']}.')
+
+            idx = np.floor(idx)
+            if idx > last_idx:
+                self.on_dummy_triggered(dummy_ticker=dummy_info['name'], topic=topic, sampler=sampler, **kwargs)
+                dummy_info['idx'] = idx
 
     def to_json(self, fmt='str', **kwargs) -> str | dict:
         data_dict: dict = super().to_json(fmt='dict')
@@ -1334,20 +1439,25 @@ class VolumeProfileSampler(FixedVolumeIntervalSampler, metaclass=abc.ABCMeta):
         self.contexts['profile_type'] = profile_type
         self.contexts['profile_config'] = profile_config
         self.contexts['profile_constructor'] = partial(constructor, **profile_config)
+        self.contexts['profile_clip'] = kwargs.get('profile_clip', (0.25, 4.))
         self.contexts['estimated_volume_interval']: dict[str, float] = {}
 
         self.volume_profile: dict[str, VolumeProfile] = {}
 
     def initialize_volume_profile(self, subscription: Iterable[str], data: dict[str, list[MarketData]] = None, profile_file: dict[str, str | pathlib.Path] = None, **kwargs):
+        if profile_file is None:
+            profile_file = {}
+
         for ticker in subscription:
             # try using the profile file cache
-            if profile_file and profile_file.get(ticker):
-                _profile_file = profile_file[ticker]
-                if os.path.isfile(_profile_file):
+            if ticker in profile_file and os.path.isfile(_profile_file := profile_file[ticker]):
+                try:
                     with open(_profile_file, 'r') as f:
                         self.volume_profile[ticker] = VolumeProfile.from_json(json.load(f))
                         LOGGER.info(f'Volume profile of {ticker} loaded from {_profile_file}.')
                         continue
+                except Exception as _:
+                    LOGGER.error(f'Failed to load {ticker} volume profile from {_profile_file}!\n{_}')
 
             profile_type = self.contexts['profile_type']
             profile_config = self.contexts['profile_config']
@@ -1357,7 +1467,7 @@ class VolumeProfileSampler(FixedVolumeIntervalSampler, metaclass=abc.ABCMeta):
             if data and data.get(ticker, []):
                 market_data_list = data[ticker]
                 LOGGER.info(f'Using {len(market_data_list)} market data to initialize {ticker} volume profile.')
-                volume_profile.fit(data=market_data_list)
+                volume_profile.fit(data=market_data_list, **kwargs)
             elif profile_type != VolumeProfileType.simple_online:
                 LOGGER.warning(f'Volume profile of {ticker} not initialized! Use with caution!')
 
@@ -1373,12 +1483,12 @@ class VolumeProfileSampler(FixedVolumeIntervalSampler, metaclass=abc.ABCMeta):
 
     def log_obs(self, ticker: str, timestamp: float, volume_accumulated: float = None, observation: dict[str, ...] = None, auto_register: bool = True, **kwargs):
         # step 0: copy the observation
-        observation_copy = {}
-
         if observation is not None:
-            observation_copy.update(observation)
+            kwargs.update(observation)
 
-        observation_copy.update(kwargs)
+        observation = kwargs
+
+        last_idx = self.contexts['idx'].get(ticker, 0)
 
         if volume_accumulated is None:
             volume_accumulated = self.contexts['vol_acc'].get(ticker, 0.)
@@ -1389,6 +1499,24 @@ class VolumeProfileSampler(FixedVolumeIntervalSampler, metaclass=abc.ABCMeta):
             estimated_volume_interval = self.contexts['estimated_volume_interval'][ticker]
         else:
             estimated_volume_ttl = volume_profile.predict()
+
+            # validate the prediction
+            match self.contexts['profile_type']:
+                case VolumeProfileType.simple_online:
+                    pass
+                case VolumeProfileType.accumulative_volume | VolumeProfileType.interval_volume | VolumeProfileType.gaussian_volume:
+                    baseline_volume_ttl = volume_profile.average
+                    profile_clip = self.contexts['profile_clip']
+                    adjusted_ratio = estimated_volume_ttl / baseline_volume_ttl
+                    if adjusted_ratio < (lower_bound := profile_clip[0]):
+                        LOGGER.warning(f'{ticker} {volume_profile.__class__.__name__} estimated ttl volume {adjusted_ratio:.2%} fails the lower bound {lower_bound:.2%}!')
+                        estimated_volume_ttl = baseline_volume_ttl * lower_bound
+                    elif adjusted_ratio > (upper_bound := profile_clip[1]):
+                        LOGGER.warning(f'{ticker} {volume_profile.__class__.__name__} estimated ttl volume {adjusted_ratio:.2%} exceeds the upper bound {upper_bound:.2%}!')
+                        estimated_volume_ttl = baseline_volume_ttl * upper_bound
+                case _:
+                    LOGGER.warning(f'Unknown volume profile type {self.contexts['profile_type']} for {ticker}! {self.__class__.__name__} will not validate estimated volume!!')
+
             estimated_n_interval = volume_profile.session_length / self.sampling_interval
             estimated_volume_interval = self.contexts['estimated_volume_interval'][ticker] = estimated_volume_ttl / estimated_n_interval
 
@@ -1398,8 +1526,10 @@ class VolumeProfileSampler(FixedVolumeIntervalSampler, metaclass=abc.ABCMeta):
         else:
             idx = volume_accumulated // estimated_volume_interval
 
+        self.contexts['idx'][ticker] = idx
+
         # step 3: update sampler
-        for topic, obs_value in observation_copy.items():
+        for topic, obs_value in observation.items():
             if topic not in self.sampler_data:
                 raise ValueError(f'Invalid sampler topic: {topic}! Expected topic {list(self.sampler_data)}.')
 
@@ -1408,14 +1538,13 @@ class VolumeProfileSampler(FixedVolumeIntervalSampler, metaclass=abc.ABCMeta):
             if ticker not in sampler_data:
                 sampler_data.init(ticker=ticker, index=0)
 
-            last_idx = sampler_data['index'][ticker]
-
             if last_idx >= idx:
                 sampler_data.observe(ticker=ticker, obs=obs_value, index=idx)
             else:
                 sampler_data.enroll(ticker=ticker)
                 sampler_data.observe(ticker=ticker, obs=obs_value, index=idx)
                 self.on_triggered(ticker=ticker, topic=topic, sampler=sampler_data)
+                self.check_dummy_triggered(topic=topic, sampler=sampler_data)
                 self.contexts['estimated_volume_interval'].pop(ticker, None)
 
     def to_json(self, fmt='str', **kwargs) -> str | dict:

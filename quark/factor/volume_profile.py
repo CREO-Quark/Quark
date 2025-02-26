@@ -20,7 +20,10 @@ from ..base import GlobalStatics
 
 
 class ProfileType(enum.StrEnum):
-    simple_online = enum.auto()
+    simple_online = enum.auto()  # prototype
+    accumulative_volume = enum.auto()  # unstable
+    interval_volume = enum.auto()
+    gaussian_volume = enum.auto()  # very unstable
 
     def get_profile(self) -> type[VolumeProfile]:
         match self:
@@ -30,6 +33,8 @@ class ProfileType(enum.StrEnum):
                 return AccumulatedVolumeProfile
             case "interval_volume":
                 return IntervalVolumeProfile
+            case "gaussian_volume":
+                return GaussianVolumeProfile
             case _:
                 raise NotImplementedError(f'Invalid profile {self}!')
 
@@ -117,6 +122,10 @@ class ObsArray(object):
         obs: SingleObs = self.buffer[idx]
         market_price = market_data.market_price
 
+        if not market_price:
+            LOGGER.info(f'Invalid {market_data.ticker} market_data {market_data.__class__}!')
+            return
+
         if not obs.is_init:
             match market_data:
                 case BarData():
@@ -163,8 +172,8 @@ class ObsArray(object):
                 obs.px_high = max(obs.px_high, market_data.market_price)
                 obs.px_low = min(obs.px_low, market_data.market_price)
 
-        obs.px_range = obs.px_high - obs.px_low
-        obs.px_diff = obs.px_close - obs.px_open
+        obs.px_range = (obs.px_high - obs.px_low) / market_price
+        obs.px_diff = (obs.px_close - obs.px_open) / market_price
 
     def get_buffer(self) -> ctypes.Array[SingleObs]:
         buffer = (self.n * SingleObs)()
@@ -226,7 +235,7 @@ class ObsArray(object):
 
         return baseline
 
-    def interpolate(self, baseline: ObsArray, threshold: float = 0.25) -> ObsArray:
+    def interpolate(self, baseline: ObsArray, threshold: float = 0.25, fill_missing='baseline') -> ObsArray:
         x_interpolated = self.__copy__()
         idx, res = divmod(self.ts, self.obs_interval)
         idx = int(idx)
@@ -241,20 +250,31 @@ class ObsArray(object):
                 obs.acc_amt += (baseline_weight / self.obs_interval) * baseline.acc_amt
                 obs.px_range = obs.px_range * np.sqrt(self.obs_interval / obs_weight) if obs_weight else 0
                 obs.px_diff = obs.px_diff * np.sqrt(self.obs_interval / obs_weight) if obs_weight else 0
-            else:
+            elif fill_missing == 'baseline':
                 obs.acc_vol = baseline.acc_vol
                 obs.acc_amt = baseline.acc_amt
                 obs.px_range = baseline.px_range
                 obs.px_diff = baseline.px_diff
+            elif isinstance(fill_missing, (float, int)):
+                obs.acc_vol = fill_missing
+                obs.acc_amt = fill_missing
+                obs.px_range = fill_missing
+                obs.px_diff = fill_missing
+            else:
+                raise ValueError("fill_missing must be 'baseline' or a int / float.")
 
         return x_interpolated
 
-    def baseline_adjusted(self, baseline: ObsArray) -> ObsArray:
+    def baseline_adjusted(self, baseline: ObsArray, percentage: bool = False) -> ObsArray:
         adjusted_x = self.__copy__()
 
         for obs, obs_baseline, obs_adjusted in zip(self, baseline, adjusted_x):
-            obs_adjusted.acc_vol = obs.acc_vol - obs_baseline.acc_vol
-            obs_adjusted.acc_amt = obs.acc_amt - obs_baseline.acc_amt
+            if percentage:
+                obs_adjusted.acc_vol = (obs.acc_vol - obs_baseline.acc_vol) / obs_baseline.acc_vol if obs_baseline.acc_vol else 0
+                obs_adjusted.acc_amt = (obs.acc_amt - obs_baseline.acc_amt) / obs_baseline.acc_amt if obs_baseline.acc_amt else 0
+            else:
+                obs_adjusted.acc_vol = obs.acc_vol - obs_baseline.acc_vol
+                obs_adjusted.acc_amt = obs.acc_amt - obs_baseline.acc_amt
             obs_adjusted.px_range = obs.px_range - obs_baseline.px_range
             obs_adjusted.px_diff = obs.px_diff - obs_baseline.px_diff
 
@@ -372,14 +392,14 @@ class VolumeProfile(object, metaclass=abc.ABCMeta):
         return market_date, ts, int(idx)
 
     @overload
-    def _baseline_adjusted(self, x: dict[datetime.date, ObsArray] = None, baseline: dict[datetime.date, ObsArray] = None, **kwargs) -> dict[datetime.date, ObsArray]:
+    def _baseline_adjusted(self, x: dict[datetime.date, ObsArray] = None, baseline: dict[datetime.date, ObsArray] = None, percentage: bool = False, **kwargs) -> dict[datetime.date, ObsArray]:
         ...
 
     @overload
-    def _baseline_adjusted(self, x: ObsArray, baseline: ObsArray, **kwargs) -> ObsArray:
+    def _baseline_adjusted(self, x: ObsArray, baseline: ObsArray, percentage: bool = False, **kwargs) -> ObsArray:
         ...
 
-    def _baseline_adjusted(self, x=None, baseline=None, **kwargs):
+    def _baseline_adjusted(self, x=None, baseline=None, percentage: bool = False, **kwargs):
         if x is None:
             x = self.x
 
@@ -391,11 +411,11 @@ class VolumeProfile(object, metaclass=abc.ABCMeta):
             case ObsArray():
                 if baseline is None:
                     baseline = self.current_baseline
-                adjusted_x = x.baseline_adjusted(baseline=baseline)
+                adjusted_x = x.baseline_adjusted(baseline=baseline, percentage=percentage)
             case dict():
                 if baseline is None:
                     baseline = self.baseline
-                adjusted_x = {market_date: self._baseline_adjusted(x=x[market_date], baseline=_baseline, **kwargs) for market_date, _baseline in baseline.items()}
+                adjusted_x = {market_date: self._baseline_adjusted(x=x[market_date], baseline=_baseline, percentage=percentage, **kwargs) for market_date, _baseline in baseline.items()}
             case _:
                 raise TypeError('x and baseline must be a ObsArray or dict[date, Array[SingleObs]]!')
 
@@ -471,6 +491,13 @@ class VolumeProfile(object, metaclass=abc.ABCMeta):
     def is_ready(self) -> bool:
         return False
 
+    @cached_property
+    def average(self) -> float:
+        if self.use_notional:
+            return self.current_baseline.amt_ttl
+        else:
+            return self.current_baseline.vol_ttl
+
 
 class SimpleOnlineProfile(VolumeProfile):
     def __init__(self, ticker: str, n_window: int, interval: float = 60, profile: Profile = None, use_notional: bool = True):
@@ -519,7 +546,7 @@ class SimpleOnlineProfile(VolumeProfile):
 
         return self
 
-    def fit(self, data: Iterable[MarketData]):
+    def fit(self, data: Iterable[MarketData], **kwargs):
         raise NotImplementedError(f'{self.__class__.__name__} not needed to be fit!')
 
     def predict(self, x: ObsArray = None, min_obs: int = None) -> float:
@@ -578,7 +605,7 @@ class SimpleOnlineProfile(VolumeProfile):
 
 class AccumulatedVolumeProfile(VolumeProfile):
     def __init__(self, ticker: str, interval: float = 5 * 60, profile: Profile = None, use_notional: bool = True):
-        super(AccumulatedVolumeProfile, self).__init__(ticker=ticker, interval=interval, profile=profile, use_notional=use_notional)
+        super().__init__(ticker=ticker, interval=interval, profile=profile, use_notional=use_notional)
 
         self._ts = 0.
         self._y_pred = np.nan
@@ -681,6 +708,7 @@ class AccumulatedVolumeProfile(VolumeProfile):
 class IntervalVolumeProfile(AccumulatedVolumeProfile):
     def __init__(self, ticker: str, interval: float = 5 * 60, profile: Profile = None, use_notional: bool = True):
         super().__init__(ticker=ticker, interval=interval, profile=profile, use_notional=use_notional)
+        self.n_lookback = 2
 
         self.curve: list[np.ndarray] = []
 
@@ -691,13 +719,14 @@ class IntervalVolumeProfile(AccumulatedVolumeProfile):
             for market_data in data:
                 self.on_data(market_data=market_data)
 
-        self.generate_baseline()
-        x_adjusted = self._baseline_adjusted(**kwargs)
+        self.generate_baseline(**{k: v for k, v in kwargs.items() if k in ['mode', 'window']})
+        x_adjusted = self._baseline_adjusted(percentage=True, **kwargs)
         beta = []
 
         for idx in range(1, self.n_interval):
-            _x_array = np.array([_x[:idx].flatten() for market_date, _x in x_adjusted.items()])
+            _x_array = np.array([_x[max(0, idx - self.n_lookback):idx].flatten() for market_date, _x in x_adjusted.items()])
             _x_array = np.hstack([_x_array, np.ones((_x_array.shape[0], 1))])
+
             if self.use_notional:
                 _y_array = np.array([x_adjusted[market_date].amt_arr[idx] for market_date in x_adjusted]).reshape(-1, 1)
             else:
@@ -714,7 +743,7 @@ class IntervalVolumeProfile(AccumulatedVolumeProfile):
             x_obs = self.current_x
             baseline = self.current_baseline
             x_interpolated = x_obs.interpolate(baseline=baseline, threshold=self.interpolation_threshold)
-            x_adjusted = self._baseline_adjusted(x=x_interpolated, baseline=baseline)
+            x_adjusted = self._baseline_adjusted(x=x_interpolated, baseline=baseline, percentage=True)
             x = x_adjusted
 
         y = []
@@ -737,13 +766,14 @@ class IntervalVolumeProfile(AccumulatedVolumeProfile):
 
                 continue
 
-            _x_array = np.append(x[:i].flatten(), 1.)
             _beta = self.curve[i - 1]
+            _x_array = np.append(x[max(0, i - self.n_lookback):i].flatten(), 1.)
+
             if self.use_notional:
-                _y = _x_array @ _beta + self.current_baseline.amt_arr[i]
+                _y = (_x_array @ _beta + 1) * self.current_baseline.amt_arr[i]
             else:
-                _y = _x_array @ _beta + self.current_baseline.vol_arr[i]
-            y.append(float(_y[0]))
+                _y = (_x_array @ _beta + 1) * self.current_baseline.vol_arr[i]
+            y.append(max(0., float(_y[0])))
 
         self._y_pred = y
         return sum(self._y_pred)
@@ -800,5 +830,231 @@ class IntervalVolumeProfile(AccumulatedVolumeProfile):
 
     def is_ready(self):
         if not self.curve:
+            return False
+        return True
+
+
+class GaussianLossRegressor(object):
+    _m1 = 1 / np.sqrt(2 * np.pi)
+
+    def __init__(self, beta: Iterable[float] = None, intercept: float = None):
+        self.beta: list[float] | None = beta
+        self.intercept: float | None = intercept
+
+        self.alpha = 1e-6
+
+    def fit(self, x, y, error_scale: float | np.ndarray = 1.):
+        # Initialize beta and intercept using linear regression
+        from scipy.optimize import minimize
+
+        if self.beta is None or self.intercept is None:
+            from sklearn.linear_model import LinearRegression
+
+            lin_reg = LinearRegression().fit(x, y)
+            initial_beta = lin_reg.coef_[0]
+            initial_intercept = lin_reg.intercept_[0]
+        else:
+            initial_beta = self.beta
+            initial_intercept = self.intercept
+
+        initial_params = np.append(initial_beta, [initial_intercept])
+
+        # Minimize the loss function
+        result = minimize(
+            fun=lambda params: self.loss(x=x, y=np.array(y), params=params),
+            x0=initial_params,
+            tol=1e-3,
+            method='SLSQP',
+        )
+
+        # Check if fitting was successful
+        if not result.success:
+            raise RuntimeError(f"Fitting did not converge: {result.message}")
+
+        # Store the fitted parameters
+        *self.beta, self.intercept = result.x
+
+    def predict(self, x: np.ndarray | list[np.ndarray] = None, params: list[float] = None) -> float | list[float]:
+        if params is not None:
+            *beta, intercept = params
+            beta = np.array(beta)
+        else:
+            beta, intercept = np.array(self.beta), self.intercept
+
+        if isinstance(x, list):
+            y_pred = []
+            for _x in x:
+                _x = np.array(_x)
+                _shape = _x.shape
+
+                if len(_x.shape) == 1:
+                    _y = np.sum(_x * beta[:_x.shape[0]]) + intercept
+                    y_pred.append(float(_y))
+                else:
+                    _y = np.array(_x) @ beta[:_x.shape[1]].reshape((-1, 1)) + intercept
+                    y_pred.extend(_y.tolist())
+        else:
+            x: np.ndarray
+
+            if len(x.shape) == 1:
+                y_pred = np.sum(x * beta[:x.shape[0]]) + intercept
+            else:
+                y_pred = x @ beta[:x.shape[1]].reshape((-1, 1)) + intercept
+
+        return y_pred
+
+    def loss(self, x: np.ndarray, y: np.ndarray, params: list[float] = None, error_scale: float | np.ndarray = 1.):
+        y_pred = np.array(self.predict(x=x, params=params))
+        y_err = np.nan_to_num(np.divide(y - y_pred, np.clip(error_scale, a_min=self.alpha, a_max=None)))
+        # prob = self._m1 * np.exp(-0.5 * np.power(y_err, 2))
+        # log_prob = np.log(prob)
+        # loss = -np.sum(log_prob)
+
+        loss = np.mean(np.power(y_err, 2))
+
+        return loss
+
+
+class GaussianVolumeProfile(VolumeProfile):
+    def __init__(self, ticker: str, interval: float = 5 * 60, profile: Profile = None, use_notional: bool = True):
+        super().__init__(ticker=ticker, interval=interval, profile=profile, use_notional=use_notional)
+
+        self._ts = 0.
+        self._y_pred = np.nan
+        self.curve = GaussianLossRegressor()
+
+        self.interpolation_threshold = 0.25  # minimal percentage of the input for interpolation
+
+    def fit(self, data: Iterable[MarketData], **kwargs):
+        if data:
+            self.clear()
+
+            for market_data in data:
+                self.on_data(market_data=market_data)
+
+        self.generate_baseline(**{k: v for k, v in kwargs.items() if k in ['mode', 'window']})
+        x_adjusted = self._baseline_adjusted(percentage=True, **kwargs)
+        x, y, beta, error_scale = {}, {}, {}, {}
+
+        for idx in range(1, self.n_interval):
+            _x_array = np.array([_x[:idx].flatten() for market_date, _x in x_adjusted.items()])
+
+            if self.use_notional:
+                _y_array = np.array([x_adjusted[market_date].amt_arr[idx] for market_date in x_adjusted])
+                _scale = np.array([self.baseline[market_date].amt_arr[idx] for market_date in x_adjusted])
+            else:
+                _y_array = np.array([x_adjusted[market_date].vol_arr[idx] for market_date in x_adjusted])
+                _scale = np.array([self.baseline[market_date].vol_arr[idx] for market_date in x_adjusted])
+
+            x[idx] = _x_array
+            y[idx] = _y_array
+            error_scale[idx] = _scale
+            _x_array = np.hstack([_x_array, np.ones((_x_array.shape[0], 1))])
+            beta[idx] = np.linalg.lstsq(_x_array, _y_array, rcond=None)[0][:-1]
+
+        init_beta = np.array([beta[i].flatten()[(beta[i - 1].shape[0] if i > 1 else 0):] for i in sorted(beta)]).flatten()
+        init_intercept = 1.
+
+        self.curve.beta = init_beta.tolist()
+        self.curve.intercept = init_intercept
+
+        x_train = [_ for _x in x.values() for _ in _x]
+        y_train = [_ for _y in y.values() for _ in _y]
+        scale = np.array([_ for _scale in error_scale.values() for _ in _scale])
+        y_pred = self.curve.predict(x_train)
+
+        self.curve.intercept = np.mean(y_train) - np.mean(y_pred)
+        self.curve.fit(x=x_train, y=y_train, error_scale=scale)
+
+    def predict(self, x: ObsArray = None) -> float:
+        if x is None:
+            x_obs = self.current_x
+            baseline = self.current_baseline
+            x_interpolated = x_obs.interpolate(baseline=baseline, threshold=self.interpolation_threshold)
+            x_adjusted = self._baseline_adjusted(x=x_interpolated, baseline=baseline, percentage=True)
+            x = x_adjusted
+
+        y = []
+        idx, _ = divmod(self.current_x.ts, self.obs_interval)
+        idx = int(idx)
+        for i in range(self.n_interval):
+            if i < idx:
+                if self.use_notional:
+                    y.append(self.current_x[i].acc_amt)
+                else:
+                    y.append(self.current_x[i].acc_vol)
+
+                continue
+
+            if i == 0:
+                if self.use_notional:
+                    y.append(self.current_baseline.amt_arr[0])
+                else:
+                    y.append(self.current_baseline.vol_arr[0])
+
+                continue
+
+            _y = self.curve.predict(x[:i].flatten())
+            if self.use_notional:
+                y.append(max(0., (_y + 1) * self.current_baseline.amt_arr[i]))
+            else:
+                y.append(max(0., (_y + 1) * self.current_baseline.vol_arr[i]))
+
+        self._y_pred = sum(y)
+        return self._y_pred
+
+    def to_json(self, fmt='str', **kwargs) -> str | dict:
+        data_dict = super().to_json(fmt='dict', **kwargs)
+
+        if self.curve is not None:
+            data_dict['curve'] = (self.curve.beta, self.curve.intercept)
+
+        if fmt == 'dict':
+            return data_dict
+        elif fmt == 'str':
+            return json.dumps(data_dict, **kwargs)
+        else:
+            raise ValueError(f'Invalid format {fmt}, except "dict" or "str".')
+
+    @classmethod
+    def from_json(cls, json_message: str | bytes | bytearray | dict):
+        if isinstance(json_message, (str, bytes)):
+            json_dict = json.loads(json_message)
+        elif isinstance(json_message, dict):
+            json_dict = json_message
+        else:
+            raise TypeError(f'{cls.__name__} can not load from json {json_message}')
+
+        self = cls(
+            ticker=json_dict['ticker'],
+            interval=json_dict['interval'],
+        )
+
+        if 'current_x' in json_dict:
+            current_obs_data = json_dict['current_x']
+            n = len(current_obs_data)
+            self.current_obs = ObsArray(n=n, interval=self.obs_interval, buffer=(n * SingleObs)(*[SingleObs(*_) for _ in current_obs_data]))
+
+        if 'current_baseline' in json_dict:
+            current_baseline_data = json_dict['current_baseline']
+            n = len(current_baseline_data)
+            self.current_baseline = ObsArray(n=n, interval=self.obs_interval, buffer=(n * SingleObs)(*[SingleObs(*_) for _ in current_baseline_data]))
+
+        if 'curve' in json_dict:
+            curve_data = json_dict['curve']
+            beta, intercept = curve_data
+            self.curve = GaussianLossRegressor(beta=beta, intercept=intercept)
+
+        return self
+
+    def clear(self):
+        super().clear()
+
+        self._ts = 0.
+        self._y_pred = None
+        self.curve = GaussianLossRegressor()
+
+    def is_ready(self):
+        if self.curve.beta is None:
             return False
         return True

@@ -7,6 +7,7 @@ import inspect
 import json
 import pathlib
 import pickle
+import sys
 from collections import deque
 from collections.abc import Iterable
 from functools import cached_property
@@ -113,6 +114,10 @@ class FactorInfo(object):
         self.additional_args = []
         self.weights_required = False
         self._is_ready = False
+        self._md5 = None
+
+    def __hash__(self) -> int:
+        return (self.name, self.md5).__hash__()
 
     def _read(self) -> Self:
         self.meta = self.read_meta(file_path=self.file)
@@ -226,6 +231,7 @@ class FactorInfo(object):
 
         factor = self.constructor(**params)
         factor.contexts['meta'].update({key: value for key, value in self.meta.items() if key != 'params'})
+        factor.contexts['factor_info'] = self
         return factor
 
     @classmethod
@@ -263,12 +269,19 @@ class FactorInfo(object):
         return factor
 
     @classmethod
-    def from_file(cls, file: str | pathlib.Path) -> list[Self]:
+    def from_file(cls, file: str | pathlib.Path, names: str | list[str] = None) -> list[Self]:
         node_list = []
         meta_dict = cls.read_meta(file_path=file)
 
+        if isinstance(names, str):
+            names = [_.strip() for _ in names.split(',')]
+
         for _params in meta_dict['params']:
             name = _params['name']
+
+            if names is not None and name not in names:
+                continue
+
             node = cls(name=name, file=file)
             node.meta = meta_dict.copy()
 
@@ -283,28 +296,32 @@ class FactorInfo(object):
 
     @cached_property
     def md5(self):
-        with open(self.file, 'rb') as f:
-            data = f.read()
-            return hashlib.md5(data).hexdigest()
+        if self._md5 is None:
+            self._md5 = hashlib.md5(pathlib.Path(self.file).read_bytes()).hexdigest()
+
+        return self._md5
 
 
 class FactorTree(object):
     def __init__(self, nodes: Iterable[FactorInfo] | FactorInfo = None):
-        self.nodes: list[FactorInfo] = [] if nodes is None else [nodes] if isinstance(nodes, dict) else list(nodes)
+        self.nodes: list[FactorInfo] = [] if nodes is None else [nodes] if isinstance(nodes, FactorInfo) else list(nodes)
+
+    def __iter__(self):
+        return iter(sorted(self.nodes, key=lambda x: f'{x.file}.{x.name}'))
 
     def __hash__(self) -> int:
-        tree_hash = hashlib.md5()
+        tree_hash = hashlib.shake_256()
 
-        for node in self.nodes:
-            tree_hash.update(f'{node.file}-{node.name}-{node.md5}'.encode('utf-8'))
+        for node in self:
+            tree_hash.update(f'{node.name}-{node.md5}'.encode('utf-8'))
 
-        return int.from_bytes(tree_hash.digest())
+        return int.from_bytes(tree_hash.digest(sys.hash_info.width // 8))
 
     def digest(self) -> str:
         tree_hash = hashlib.sha256()
 
-        for node in self.nodes:
-            tree_hash.update(f'{node.file}-{node.name}-{node.md5}'.encode('utf-8'))
+        for node in self:
+            tree_hash.update(f'{node.name}-{node.md5}'.encode('utf-8'))
 
         return tree_hash.hexdigest()
 
@@ -324,6 +341,10 @@ class FactorTree(object):
         except Exception as e:
             raise e
 
+    def extend(self, nodes: Iterable[FactorInfo]) -> None:
+        for node in nodes:
+            self._append_node(node=node)
+
     def _add_node(self, name: str, file: str | pathlib.Path) -> None:
         node = FactorInfo(name=name, file=file).load()
 
@@ -339,7 +360,7 @@ class FactorTree(object):
     def to_json(self, fmt='str', **kwargs) -> str | dict:
         data_dict = dict(
             dtype='FactorTree',
-            nodes=[dict(name=node.name, file=node.file) for node in self.nodes],
+            nodes=[dict(name=node.name, file=node.file, md5=node.md5) for node in self.nodes],
         )
 
         if fmt == 'dict':
@@ -356,10 +377,22 @@ class FactorTree(object):
         else:
             json_dict = json.loads(json_message)
 
-        self = cls(
-            nodes=[FactorInfo(name=node_dict['name'], file=node_dict['file']).load() for node_dict in json_dict['nodes']],
-        )
+        nodes = []
+        for node_dict in json_dict['nodes']:
+            node = FactorInfo(name=node_dict['name'], file=node_dict['file'])
 
+            try:
+                node.load()
+            except Exception as e:
+                LOGGER.warning(f'Failed to validate <{cls.__name__}>({node.name}) from {node.file}.\n{e}')
+                node._md5 = node_dict['md5']
+
+            if node.md5 != node_dict['md5']:
+                LOGGER.warning(f'{node.name} md5 not matched! Factor might be incorrect.')
+
+            nodes.append(node)
+
+        self = cls(nodes=nodes)
         return self
 
     def dump(self, file_path: str | pathlib.Path) -> None:
@@ -681,6 +714,9 @@ class FactorMonitor(MarketDataMonitor, metaclass=abc.ABCMeta):
         if isinstance(self, AdaptiveVolumeIntervalSampler):
             AdaptiveVolumeIntervalSampler.clear(self=self)
 
+        if isinstance(self, VolumeProfileSampler):
+            VolumeProfileSampler.clear(self=self)
+
     def update_from_json(self, json_dict: dict) -> Self:
         """
         a utility function for .from_json()
@@ -797,6 +833,10 @@ class FactorMonitor(MarketDataMonitor, metaclass=abc.ABCMeta):
         )
 
         return params_list
+
+    @cached_property
+    def prefix(self):
+        return self.name.removeprefix("Monitor.")
 
     @property
     def params(self) -> dict:
@@ -932,8 +972,18 @@ class EMA(object):
             else:
                 raise TypeError(f'Invalid {replace_na=}, expect float or dict of float.')
 
-    def enroll(self, ticker: str, name: str):
-        current = self.ema[name][ticker]
+    def enroll(self, ticker: str = None, name: str = None):
+        if ticker is None:
+            for _ticker in self._ema_current:
+                self.enroll(ticker=_ticker, name=name)
+            return
+
+        if name is None:
+            for _name in self.ema:
+                self.enroll(ticker=ticker, name=_name)
+            return
+
+        current = self.ema[name].get(ticker, np.nan)
         latest = self._ema_current[name].get(ticker, np.nan)
 
         if np.isfinite(current):
@@ -942,11 +992,6 @@ class EMA(object):
             self._ema_memory[name][ticker] = latest
 
         self._ema_current[name].pop(ticker, None)
-
-    def enroll_all(self):
-        for name in self.ema:
-            for ticker in self._ema_current:
-                self.enroll(ticker=ticker, name=name)
 
     def to_json(self, fmt='str', **kwargs) -> str | dict:
         data_dict = dict(

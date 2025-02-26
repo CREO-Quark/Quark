@@ -1,3 +1,4 @@
+import numpy as np
 from algo_engine.base import MarketData, TradeData, TransactionData
 
 from .. import SamplerMode, Synthetic, FactorMonitor, VolumeProfileSampler, VolumeProfileType, AdaptiveVolumeIntervalSampler, FixedIntervalSampler, ALPHA_001, EMA, SamplerData
@@ -14,7 +15,8 @@ class TrendAuxiliaryMonitor(FactorMonitor, FixedIntervalSampler):
         self.ema = EMA(alpha=self.alpha)
 
         self.register_sampler(topic='price', mode=SamplerMode.update)
-        self.register_sampler(topic='notional', mode=SamplerMode.accumulate)
+        # self.register_sampler(topic='notional', mode=SamplerMode.accumulate)
+
         self.ema.register_ema(name='pct_change')
 
     def on_trade_data(self, trade_data: TradeData | TransactionData, **kwargs):
@@ -25,21 +27,41 @@ class TrendAuxiliaryMonitor(FactorMonitor, FixedIntervalSampler):
         self.log_obs(ticker=ticker, timestamp=timestamp, price=price)
 
     def on_triggered(self, ticker: str, topic: str, sampler: SamplerData, **kwargs):
+        if topic != 'price':
+            return
+
         price_history = sampler.history[ticker]
 
-        if len(price_history) >= 2:
-            latest_pct_change = (price_history[-1] / price_history[-2]) - 1
+        if len(price_history) >= 2 and np.isfinite(latest_pct_change := (price_history[-1] / price_history[-2]) - 1):
             self.ema.update_ema(ticker=ticker, pct_change=latest_pct_change)
-            self.ema.enroll(ticker=ticker, name='pct_change')
+        else:
+            self.ema.update_ema(ticker=ticker, pct_change=0.)
+        self.ema.enroll(ticker=ticker, name='pct_change')
 
     def factor_names(self, subscription: list[str]) -> list[str]:
         return [
             f'{self.name.removeprefix("Monitor.")}.{ticker}' for ticker in subscription
         ]
 
+    def pct_change(self) -> dict[str, float]:
+        pct_change = {}
+        latest = self.get_latest(topic='price')
+        history = self.get_history(topic='price')
+
+        for ticker in latest:
+            _latest = latest[ticker]
+            _history = history[ticker]
+            _current = (_latest / _history) - 1
+
+            if np.isfinite(_current):
+                pct_change[ticker] = self.ema.update_ema(ticker=ticker, pct_change=_current)
+
+        return pct_change
+
     @property
     def value(self) -> dict[str, float]:
-        return self.ema.ema.get('pct_change', {})
+        # return self.ema.ema.get('pct_change', {})
+        return self.pct_change()
 
 
 class TrendAdaptiveAuxiliaryMonitor(TrendAuxiliaryMonitor, AdaptiveVolumeIntervalSampler):
